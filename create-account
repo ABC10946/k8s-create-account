@@ -1,0 +1,162 @@
+#!/bin/bash
+
+# スクリプトが途中で失敗した場合に終了する
+set -e
+
+# --- 設定 ---
+# 第1引数が存在する場合はユーザー名として使用
+USERNAME=${1:-my-new-user}
+OUTPUT_FILE="${USERNAME}-kubeconfig"
+ADMIN_KUBECONFIG="/etc/kubernetes/admin.conf"
+CSR_NAME="${USERNAME}-csr"
+
+# 環境変数でadmin.confを指定
+export KUBECONFIG="${ADMIN_KUBECONFIG}"
+
+# 実行権限の確認
+if [[ ! -r "${ADMIN_KUBECONFIG}" ]]; then
+    echo "エラー: ${ADMIN_KUBECONFIG} が読み取り可能ではありません。管理者権限で実行しているか確認してください。"
+    exit 1
+fi
+
+echo "🌟 ${ADMIN_KUBECONFIG}を使用して、ユーザー: ${USERNAME} のkubeconfigを生成します。"
+
+# kubectlの実行可能性を確認
+if ! command -v kubectl &> /dev/null; then
+    echo "エラー: kubectlコマンドが見つかりません。パスが通っているか確認してください。"
+    exit 1
+fi
+
+# --- 1. ネームスペースの作成 ---
+echo "--- ネームスペースを作成しています..."
+kubectl create namespace "${USERNAME}" --dry-run=client -o yaml | kubectl apply -f -
+
+# --- 2. 秘密鍵とCSRの生成 ---
+echo "--- 秘密鍵とCSRを生成しています..."
+# ユーザーの秘密鍵を生成
+openssl genrsa -out "${USERNAME}.key" 2048
+# CSRを生成 (Common Nameをユーザー名に、Organizationをグループ名に設定)
+openssl req -new -key "${USERNAME}.key" -out "${USERNAME}.csr" -subj "/CN=${USERNAME}/O=${USERNAME}"
+
+# CSRの内容をbase64エンコード
+CSR_CONTENT=$(cat "${USERNAME}.csr" | base64 | tr -d '\n')
+
+# --- 3. CSRリソースの作成 ---
+echo "--- CertificateSigningRequestリソースを作成しています..."
+kubectl apply -f - <<EOF
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: ${CSR_NAME}
+spec:
+  request: ${CSR_CONTENT}
+  signerName: kubernetes.io/kube-apiserver-client
+  expirationSeconds: 31536000  # 1年
+  usages:
+  - digital signature
+  - key encipherment
+  - client auth
+EOF
+
+# --- 4. CSRの承認と待機 ---
+echo "--- CSRを承認しています..."
+kubectl certificate approve "${CSR_NAME}"
+
+# 証明書が発行されるまで待機するループ
+echo "--- クライアント証明書の発行を待機しています..."
+MAX_RETRIES=10
+RETRY_COUNT=0
+while [ ${RETRY_COUNT} -lt ${MAX_RETRIES} ]; do
+    CLIENT_CERT=$(kubectl get csr "${CSR_NAME}" -o jsonpath='{.status.certificate}' 2>/dev/null || echo "")
+    if [ -n "${CLIENT_CERT}" ]; then
+        echo "✅ 証明書が発行されました。"
+        break
+    fi
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    echo "証明書が見つかりません。リトライします... (${RETRY_COUNT}/${MAX_RETRIES})"
+    sleep 2
+done
+
+if [ -z "${CLIENT_CERT}" ]; then
+    echo "エラー: 証明書を取得できませんでした。手動で確認してください。"
+    exit 1
+fi
+
+# Base64デコードしてファイルに保存
+echo "${CLIENT_CERT}" | base64 --decode > "${USERNAME}.crt"
+
+# --- 5. RBACのためのRoleとRoleBindingの作成 ---
+# ネームスペースとユーザー名が同じである前提
+echo "--- RBACの役割とバインディングを設定しています..."
+kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${USERNAME}-role
+  namespace: ${USERNAME}
+rules:
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+EOF
+
+kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${USERNAME}-binding
+  namespace: ${USERNAME}
+subjects:
+- kind: User
+  apiGroup: rbac.authorization.k8s.io
+  name: ${USERNAME}
+roleRef:
+  kind: Role
+  name: ${USERNAME}-role
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+# --- 6. kubeconfigファイルの生成 ---
+echo "--- ${OUTPUT_FILE}を生成しています..."
+
+# --rawオプションを追加してcluster情報を取得
+CLUSTER_NAME=$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].name}')
+CLUSTER_SERVER=$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
+CLUSTER_CA_DATA=$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+
+# 証明書と秘密鍵をBase64エンコード
+CLIENT_CERT_DATA=$(cat "${USERNAME}.crt" | base64 | tr -d '\n')
+CLIENT_KEY_DATA=$(cat "${USERNAME}.key" | base64 | tr -d '\n')
+
+cat <<EOF > "${OUTPUT_FILE}"
+apiVersion: v1
+kind: Config
+clusters:
+- name: ${CLUSTER_NAME}
+  cluster:
+    server: ${CLUSTER_SERVER}
+    certificate-authority-data: ${CLUSTER_CA_DATA}
+users:
+- name: ${USERNAME}
+  user:
+    client-certificate-data: ${CLIENT_CERT_DATA}
+    client-key-data: ${CLIENT_KEY_DATA}
+contexts:
+- name: ${USERNAME}-context
+  context:
+    cluster: ${CLUSTER_NAME}
+    user: ${USERNAME}
+    namespace: ${USERNAME}
+current-context: ${USERNAME}-context
+EOF
+
+echo "✅ kubeconfigファイル '${OUTPUT_FILE}' が正常に作成されました。"
+echo "✅ 関連ファイル: ${USERNAME}.key, ${USERNAME}.crt"
+echo "これらのファイルを新しいユーザーと共有できます。"
+
+# クリーンアップ (CSRリソースを削除)
+echo "--- CertificateSigningRequestリソースをクリーンアップしています..."
+kubectl delete csr "${CSR_NAME}"
+rm ${USERNAME}.key ${USERNAME}.crt ${USERNAME}.csr
+
+echo "完了しました。"
