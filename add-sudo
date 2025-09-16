@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# kubectl-sudoプラグインを利用するためのスクリプト
+# 指定したユーザをClusterRoleBindingに追加するとkubectl-sudoプラグインにより管理者権限を付与することができる。
+# スクリプトが途中で失敗した場合に終了する
+set -e
+
+# --- 設定 ---
+# 第1引数: ユーザー名 (必須)
+USERNAME=${1}
+# 対象のClusterRoleBinding名
+CRB_NAME="cluster-administrators"
+# admin.confのパス
+ADMIN_KUBECONFIG="/etc/kubernetes/admin.conf"
+
+# 引数のバリデーション
+if [ -z "${USERNAME}" ]; then
+    echo "エラー: ユーザー名を指定してください。"
+    echo "使用方法: $0 <ユーザー名>"
+    exit 1
+fi
+
+# 環境変数でadmin.confを指定
+export KUBECONFIG="${ADMIN_KUBECONFIG}"
+
+# 実行権限の確認
+if [[ ! -r "${ADMIN_KUBECONFIG}" ]]; then
+    echo "エラー: ${ADMIN_KUBECONFIG} が読み取り可能ではありません。管理者権限で実行しているか確認してください。"
+    exit 1
+fi
+
+echo "🌟 ClusterRoleBinding '${CRB_NAME}' にユーザー '${USERNAME}' を追加します。"
+
+# ClusterRoleBindingが存在するか確認
+# 存在しない場合は新規作成
+if ! kubectl get clusterrolebinding "${CRB_NAME}" &> /dev/null; then
+    echo "--- ClusterRoleBinding '${CRB_NAME}' が存在しないため、新規作成します。"
+    kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${CRB_NAME}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: impersonate
+subjects: []
+EOF
+else
+    echo "--- ClusterRoleBinding '${CRB_NAME}' を更新します。"
+fi
+
+# 既存のsubjectsを取得し、新しいユーザーを追加
+echo "--- 既存のsubjectsを取得..."
+# `jq`コマンドを使用して`subjects`配列を抽出
+EXISTING_SUBJECTS=$(kubectl get clusterrolebinding "${CRB_NAME}" -o json | jq -r '.subjects | if . == null then "[]" else . | tostring end')
+
+# 新しいSubjectをJSON形式で作成
+NEW_SUBJECT_JSON="{\"kind\":\"User\",\"apiGroup\":\"rbac.authorization.k8s.io\",\"name\":\"${USERNAME}\"}"
+
+# ユーザーが既に存在するかチェック
+if echo "${EXISTING_SUBJECTS}" | grep -q "${NEW_SUBJECT_JSON}"; then
+    echo "警告: ユーザー '${USERNAME}' は既に ClusterRoleBinding に存在します。スキップします。"
+else
+    # `jq`コマンドでsubjectsに新しいユーザーを追加
+    echo "--- 新しいユーザーをsubjectsに追加..."
+    UPDATED_SUBJECTS=$(echo "${EXISTING_SUBJECTS}" | jq ". += [${NEW_SUBJECT_JSON}]")
+
+    # `patch`コマンドでClusterRoleBindingを更新
+    # 既存の subjects を置き換える
+    kubectl patch clusterrolebinding "${CRB_NAME}" --type='json' -p="[{\"op\": \"replace\", \"path\": \"/subjects\", \"value\": ${UPDATED_SUBJECTS}}]"
+
+    echo "✅ ユーザー '${USERNAME}' が正常に追加されました。"
+fi
+
+echo "完了しました。"
